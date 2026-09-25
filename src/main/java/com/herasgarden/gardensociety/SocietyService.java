@@ -1,6 +1,8 @@
 package com.herasgarden.gardensociety;
 
 import com.herasgarden.gardencore.api.GardenPlatform;
+import com.herasgarden.gardencore.api.claim.ClaimDirectoryService;
+import com.herasgarden.gardencore.api.claim.ClaimSummary;
 import com.herasgarden.gardencore.api.land.GardenTerritoryDirectory;
 import com.herasgarden.gardencore.api.land.PropertyAddress;
 import com.herasgarden.gardencore.api.land.PropertyDirectory;
@@ -34,6 +36,7 @@ public final class SocietyService {
     private final JavaPlugin plugin;
     private final GardenPlatform platform;
     private final GardenTerritoryDirectory territories;
+    private final ClaimDirectoryService claims;
     private final TerritoryMembershipProvider memberships;
     private final PropertyDirectory properties;
     private final BusinessDirectory businesses;
@@ -42,6 +45,7 @@ public final class SocietyService {
             JavaPlugin plugin,
             GardenPlatform platform,
             GardenTerritoryDirectory territories,
+            ClaimDirectoryService claims,
             TerritoryMembershipProvider memberships,
             PropertyDirectory properties,
             BusinessDirectory businesses
@@ -49,6 +53,7 @@ public final class SocietyService {
         this.plugin = plugin;
         this.platform = platform;
         this.territories = territories;
+        this.claims = claims;
         this.memberships = memberships;
         this.properties = properties;
         this.businesses = businesses;
@@ -57,12 +62,12 @@ public final class SocietyService {
     public void setHousingEligibility(Player actor, UUID propertyId, boolean eligible) throws SQLException {
         PropertyAddress property = properties.find(propertyId)
                 .orElseThrow(() -> new IllegalArgumentException("That property does not exist."));
-        ClaimInfo claim = claim(property.claimId())
+        ClaimSummary claim = claims.find(property.claimId())
                 .orElseThrow(() -> new IllegalArgumentException("The property claim is missing."));
         if (!isNpcHousingType(claim)) {
             throw new IllegalArgumentException("Only Homes and Apartment units can be NPC-eligible housing.");
         }
-        UUID territoryId = territoryForClaim(property.claimId())
+        UUID territoryId = claims.territoryAncestor(property.claimId())
                 .orElseThrow(() -> new IllegalArgumentException("That property is not inside a Territory."));
         if (!territories.canManage(actor, territoryId) && !actor.hasPermission("gardensociety.admin")) {
             throw new IllegalArgumentException("You must manage that Territory to change Society housing.");
@@ -294,8 +299,8 @@ public final class SocietyService {
                 if (occupied(propertyId)) continue;
                 PropertyAddress property = properties.find(propertyId).orElse(null);
                 if (property == null) continue;
-                if (!territoryForClaim(property.claimId()).filter(territoryId::equals).isPresent()) continue;
-                ClaimInfo info = claim(property.claimId()).orElse(null);
+                if (!claims.territoryAncestor(property.claimId()).filter(territoryId::equals).isPresent()) continue;
+                ClaimSummary info = claims.find(property.claimId()).orElse(null);
                 if (info == null || !isNpcHousingType(info)) continue;
                 PropertyMailbox mailbox = properties.mailbox(propertyId).orElse(null);
                 if (mailbox == null) continue;
@@ -319,31 +324,7 @@ public final class SocietyService {
         }
     }
 
-    private Optional<UUID> territoryForClaim(UUID claimId) throws SQLException {
-        UUID current = claimId;
-        for (int i = 0; i < 32 && current != null; i++) {
-            ClaimInfo info = claim(current).orElse(null);
-            if (info == null) return Optional.empty();
-            if ("TERRITORY".equalsIgnoreCase(info.type())) return Optional.of(current);
-            current = info.parentId();
-        }
-        return Optional.empty();
-    }
-
-    private Optional<ClaimInfo> claim(UUID claimId) throws SQLException {
-        try (Connection c = platform.storage().connection();
-             PreparedStatement s = c.prepareStatement("SELECT claim_type, claim_tag, parent_uuid FROM gc_claims WHERE claim_uuid = ?")) {
-            s.setString(1, claimId.toString());
-            try (ResultSet r = s.executeQuery()) {
-                if (!r.next()) return Optional.empty();
-                String parent = r.getString("parent_uuid");
-                return Optional.of(new ClaimInfo(r.getString("claim_type"), r.getString("claim_tag"),
-                        parent == null ? null : UUID.fromString(parent)));
-            }
-        }
-    }
-
-    private boolean isNpcHousingType(ClaimInfo claim) {
+    private boolean isNpcHousingType(ClaimSummary claim) {
         return "HOME".equalsIgnoreCase(claim.type())
                 || ("UNIT".equalsIgnoreCase(claim.type()) && "APARTMENT".equalsIgnoreCase(claim.tag()));
     }
@@ -379,7 +360,6 @@ public final class SocietyService {
         );
     }
 
-    private record ClaimInfo(String type, String tag, UUID parentId) {}
     private record Housing(PropertyAddress property, PropertyMailbox mailbox) {}
 
     public record Resident(UUID id, String name, UUID territoryClaimId, UUID homePropertyId, UUID positionId,

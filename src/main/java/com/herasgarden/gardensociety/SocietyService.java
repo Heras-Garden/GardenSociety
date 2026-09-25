@@ -3,10 +3,13 @@ package com.herasgarden.gardensociety;
 import com.herasgarden.gardencore.api.GardenPlatform;
 import com.herasgarden.gardencore.api.claim.ClaimDirectoryService;
 import com.herasgarden.gardencore.api.claim.ClaimSummary;
+import com.herasgarden.gardencore.api.claim.ClaimTransferPolicy;
 import com.herasgarden.gardencore.api.land.GardenTerritoryDirectory;
 import com.herasgarden.gardencore.api.land.PropertyAddress;
 import com.herasgarden.gardencore.api.land.PropertyDirectory;
 import com.herasgarden.gardencore.api.land.PropertyMailbox;
+import com.herasgarden.gardencore.api.land.PropertyManagementService;
+import com.herasgarden.gardencore.api.land.PropertyPurchaseResult;
 import com.herasgarden.gardencore.api.land.TerritorySummary;
 import com.herasgarden.gardencore.api.membership.TerritoryMembershipProvider;
 import com.herasgarden.gardentrade.api.BusinessDirectory;
@@ -39,7 +42,11 @@ public final class SocietyService {
     private final ClaimDirectoryService claims;
     private final TerritoryMembershipProvider memberships;
     private final PropertyDirectory properties;
+    private final PropertyManagementService propertyManagement;
+    private final ClaimTransferPolicy transferPolicy;
     private final BusinessDirectory businesses;
+    private final long maxHomePrice;
+    private final long startingObols;
 
     public SocietyService(
             JavaPlugin plugin,
@@ -48,7 +55,11 @@ public final class SocietyService {
             ClaimDirectoryService claims,
             TerritoryMembershipProvider memberships,
             PropertyDirectory properties,
-            BusinessDirectory businesses
+            PropertyManagementService propertyManagement,
+            ClaimTransferPolicy transferPolicy,
+            BusinessDirectory businesses,
+            long maxHomePrice,
+            long startingObols
     ) {
         this.plugin = plugin;
         this.platform = platform;
@@ -56,7 +67,11 @@ public final class SocietyService {
         this.claims = claims;
         this.memberships = memberships;
         this.properties = properties;
+        this.propertyManagement = propertyManagement;
+        this.transferPolicy = transferPolicy;
         this.businesses = businesses;
+        this.maxHomePrice = maxHomePrice;
+        this.startingObols = startingObols;
     }
 
     public void setHousingEligibility(Player actor, UUID propertyId, boolean eligible) throws SQLException {
@@ -76,7 +91,7 @@ public final class SocietyService {
         try (Connection c = platform.storage().connection()) {
             int changed;
             try (PreparedStatement u = c.prepareStatement(
-                    "UPDATE gs_housing SET npc_eligible = ?, updated_by = ?, updated_at = ? WHERE property_uuid = ?")) {
+                    "UPDATE gs_housing SET npc_eligible = ?, audience = 'SOCIETY', updated_by = ?, updated_at = ? WHERE property_uuid = ?")) {
                 u.setInt(1, eligible ? 1 : 0);
                 u.setString(2, actor.getUniqueId().toString());
                 u.setLong(3, now);
@@ -85,7 +100,7 @@ public final class SocietyService {
             }
             if (changed == 0) {
                 try (PreparedStatement i = c.prepareStatement(
-                        "INSERT INTO gs_housing (property_uuid, npc_eligible, updated_by, updated_at) VALUES (?, ?, ?, ?)")) {
+                        "INSERT INTO gs_housing (property_uuid, npc_eligible, audience, updated_by, updated_at) VALUES (?, ?, 'SOCIETY', ?, ?)")) {
                     i.setString(1, propertyId.toString());
                     i.setInt(2, eligible ? 1 : 0);
                     i.setString(3, actor.getUniqueId().toString());
@@ -174,13 +189,31 @@ public final class SocietyService {
             if (resident == null) return;
             if (resident.positionId() != null) businesses.vacate(resident.positionId(), villagerId);
             memberships.clearMembership(villagerId);
+            UUID householdId = resident.householdId();
             try (Connection c = platform.storage().connection();
                  PreparedStatement s = c.prepareStatement("DELETE FROM gs_residents WHERE villager_uuid = ?")) {
                 s.setString(1, villagerId.toString());
                 s.executeUpdate();
             }
+            if (householdId != null && !householdHasMembers(householdId)) {
+                try (Connection c = platform.storage().connection();
+                     PreparedStatement s = c.prepareStatement(
+                             "DELETE FROM gs_households WHERE household_uuid = ?")) {
+                    s.setString(1, householdId.toString());
+                    s.executeUpdate();
+                }
+            }
         } catch (SQLException exception) {
             plugin.getLogger().warning("Could not clean up Society resident " + villagerId + ": " + exception.getMessage());
+        }
+    }
+
+    private boolean householdHasMembers(UUID householdId) throws SQLException {
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT 1 FROM gs_residents WHERE household_uuid = ? LIMIT 1")) {
+            s.setString(1, householdId.toString());
+            try (ResultSet r = s.executeQuery()) { return r.next(); }
         }
     }
 
@@ -197,7 +230,16 @@ public final class SocietyService {
     public int population(String territoryName) {
         TerritorySummary territory = territories.findByName(territoryName)
                 .orElseThrow(() -> new IllegalArgumentException("That Territory does not exist."));
-        return memberships.members(territory.claimId()).size();
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT COUNT(*) total FROM gs_residents WHERE territory_claim_uuid = ?")) {
+            s.setString(1, territory.claimId().toString());
+            try (ResultSet r = s.executeQuery()) {
+                return r.next() ? r.getInt("total") : 0;
+            }
+        } catch (SQLException exception) {
+            throw new IllegalStateException("Society population could not be read.", exception);
+        }
     }
 
     public String card(Resident resident) throws SQLException {
@@ -232,29 +274,46 @@ public final class SocietyService {
         UUID positionId = vacancy == null ? null : vacancy.positionId();
         String occupation = vacancy == null ? null : vacancy.positionTitle() + " @ " + vacancy.businessName();
 
+        Household household;
+        if (parent1 != null || parent2 != null) {
+            household = householdForParent(parent1, parent2)
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "A Society child needs an existing parental household."));
+            home = housingForHousehold(household).orElse(null);
+        } else {
+            if (home == null) {
+                throw new IllegalArgumentException("A new Society resident needs an eligible home.");
+            }
+            household = purchaseHome(territory, home, name);
+        }
+
         memberships.setMembership(villager.getUniqueId(), territory.claimId());
         boolean hired = false;
         try {
             if (vacancy != null) {
                 hired = businesses.hire(vacancy.positionId(), villager.getUniqueId(), name);
-                if (!hired) throw new IllegalArgumentException("The selected job was filled before the resident could take it.");
+                if (!hired) throw new IllegalArgumentException(
+                        "The selected job was filled before the resident could take it.");
             }
             long now = System.currentTimeMillis();
             try (Connection c = platform.storage().connection();
                  PreparedStatement s = c.prepareStatement(
                          "INSERT INTO gs_residents "
-                                 + "(villager_uuid, resident_name, territory_claim_uuid, home_property_uuid, position_uuid, occupation_label, "
-                                 + "parent1_uuid, parent2_uuid, born_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                                 + "(villager_uuid, resident_name, territory_claim_uuid, household_uuid, "
+                                 + "home_property_uuid, position_uuid, occupation_label, "
+                                 + "parent1_uuid, parent2_uuid, born_at, created_at) "
+                                 + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
                 s.setString(1, villager.getUniqueId().toString());
                 s.setString(2, name);
                 s.setString(3, territory.claimId().toString());
-                s.setString(4, home == null ? null : home.property().propertyId().toString());
-                s.setString(5, positionId == null ? null : positionId.toString());
-                s.setString(6, occupation);
-                s.setString(7, parent1 == null ? null : parent1.toString());
-                s.setString(8, parent2 == null ? null : parent2.toString());
-                if (parent1 == null && parent2 == null) s.setObject(9, null); else s.setLong(9, now);
-                s.setLong(10, now);
+                s.setString(4, household.id().toString());
+                s.setString(5, household.homePropertyId().toString());
+                s.setString(6, positionId == null ? null : positionId.toString());
+                s.setString(7, occupation);
+                s.setString(8, parent1 == null ? null : parent1.toString());
+                s.setString(9, parent2 == null ? null : parent2.toString());
+                if (parent1 == null && parent2 == null) s.setObject(10, null); else s.setLong(10, now);
+                s.setLong(11, now);
                 s.executeUpdate();
             }
         } catch (Exception exception) {
@@ -269,8 +328,95 @@ public final class SocietyService {
 
         applyIdentity(villager, name);
         Resident resident = resident(villager.getUniqueId()).orElseThrow();
-        if (immigration && home != null && positionId != null) logImmigration(territory.claimId(), resident.id(), home.property().propertyId(), positionId);
+        if (immigration && home != null && positionId != null) {
+            logImmigration(
+                    territory.claimId(),
+                    resident.id(),
+                    household.homePropertyId(),
+                    positionId
+            );
+        }
         return resident;
+    }
+
+    private Household purchaseHome(
+            TerritorySummary territory,
+            Housing home,
+            String residentName
+    ) throws SQLException {
+        UUID householdId = UUID.randomUUID();
+        long current = platform.currency().balance(householdId);
+        long target = Math.max(startingObols, home.property().price());
+        if (current < target && !platform.currency().deposit(householdId, target - current)) {
+            throw new IllegalArgumentException("Society household starting funds could not be created.");
+        }
+
+        PropertyPurchaseResult purchase = propertyManagement.purchaseAccount(
+                householdId,
+                residentName + " Household",
+                "SOCIETY_CITIZEN",
+                home.property().propertyId()
+        );
+        if (!purchase.success()) {
+            throw new IllegalArgumentException("Society home purchase failed: " + purchase.message());
+        }
+
+        Household household = new Household(
+                householdId,
+                territory.claimId(),
+                home.property().propertyId(),
+                householdId,
+                System.currentTimeMillis()
+        );
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "INSERT INTO gs_households "
+                             + "(household_uuid, territory_claim_uuid, home_property_uuid, owner_account_uuid, created_at) "
+                             + "VALUES (?, ?, ?, ?, ?)")) {
+            s.setString(1, household.id().toString());
+            s.setString(2, household.territoryId().toString());
+            s.setString(3, household.homePropertyId().toString());
+            s.setString(4, household.ownerAccountId().toString());
+            s.setLong(5, household.createdAt());
+            s.executeUpdate();
+        }
+        return household;
+    }
+
+    private Optional<Household> householdForParent(UUID parent1, UUID parent2) throws SQLException {
+        for (UUID parent : List.of(parent1, parent2)) {
+            if (parent == null) continue;
+            Resident resident = resident(parent).orElse(null);
+            if (resident == null || resident.householdId() == null) continue;
+            Optional<Household> household = household(resident.householdId());
+            if (household.isPresent()) return household;
+        }
+        return Optional.empty();
+    }
+
+    private Optional<Household> household(UUID householdId) throws SQLException {
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT * FROM gs_households WHERE household_uuid = ?")) {
+            s.setString(1, householdId.toString());
+            try (ResultSet r = s.executeQuery()) {
+                if (!r.next()) return Optional.empty();
+                return Optional.of(new Household(
+                        UUID.fromString(r.getString("household_uuid")),
+                        UUID.fromString(r.getString("territory_claim_uuid")),
+                        UUID.fromString(r.getString("home_property_uuid")),
+                        UUID.fromString(r.getString("owner_account_uuid")),
+                        r.getLong("created_at")
+                ));
+            }
+        }
+    }
+
+    private Optional<Housing> housingForHousehold(Household household) throws SQLException {
+        PropertyAddress property = properties.find(household.homePropertyId()).orElse(null);
+        if (property == null) return Optional.empty();
+        PropertyMailbox mailbox = properties.mailbox(property.propertyId()).orElse(null);
+        return mailbox == null ? Optional.empty() : Optional.of(new Housing(property, mailbox));
     }
 
     private void logImmigration(UUID territoryId, UUID villagerId, UUID propertyId, UUID positionId) {
@@ -290,22 +436,31 @@ public final class SocietyService {
     }
 
     private List<Housing> vacantHomes(UUID territoryId) throws SQLException {
-        List<Housing> homes = new ArrayList<>();
+        List<UUID> eligible = new ArrayList<>();
         try (Connection c = platform.storage().connection();
-             PreparedStatement s = c.prepareStatement("SELECT property_uuid FROM gs_housing WHERE npc_eligible = 1 ORDER BY updated_at ASC");
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT property_uuid FROM gs_housing "
+                             + "WHERE npc_eligible = 1 AND audience = 'SOCIETY' ORDER BY updated_at ASC");
              ResultSet r = s.executeQuery()) {
-            while (r.next()) {
-                UUID propertyId = UUID.fromString(r.getString("property_uuid"));
-                if (occupied(propertyId)) continue;
-                PropertyAddress property = properties.find(propertyId).orElse(null);
-                if (property == null) continue;
-                if (!claims.territoryAncestor(property.claimId()).filter(territoryId::equals).isPresent()) continue;
-                ClaimSummary info = claims.find(property.claimId()).orElse(null);
-                if (info == null || !isNpcHousingType(info)) continue;
-                PropertyMailbox mailbox = properties.mailbox(propertyId).orElse(null);
-                if (mailbox == null) continue;
-                homes.add(new Housing(property, mailbox));
+            while (r.next()) eligible.add(UUID.fromString(r.getString("property_uuid")));
+        }
+
+        List<Housing> homes = new ArrayList<>();
+        for (UUID propertyId : eligible) {
+            if (occupied(propertyId)) continue;
+            PropertyAddress property = properties.find(propertyId).orElse(null);
+            if (property == null || !property.forSale() || property.price() <= 0
+                    || property.price() > maxHomePrice) continue;
+            if (!claims.territoryAncestor(property.claimId()).filter(territoryId::equals).isPresent()) continue;
+            ClaimSummary info = claims.find(property.claimId()).orElse(null);
+            if (info == null || !isNpcHousingType(info)) continue;
+            if (transferPolicy != null) {
+                Optional<String> blocked = transferPolicy.blockReason(property.claimId());
+                if (blocked != null && blocked.isPresent()) continue;
             }
+            PropertyMailbox mailbox = properties.mailbox(propertyId).orElse(null);
+            if (mailbox == null) continue;
+            homes.add(new Housing(property, mailbox));
         }
         return List.copyOf(homes);
     }
@@ -318,7 +473,8 @@ public final class SocietyService {
 
     private boolean occupied(UUID propertyId) throws SQLException {
         try (Connection c = platform.storage().connection();
-             PreparedStatement s = c.prepareStatement("SELECT 1 FROM gs_residents WHERE home_property_uuid = ? LIMIT 1")) {
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT 1 FROM gs_households WHERE home_property_uuid = ? LIMIT 1")) {
             s.setString(1, propertyId.toString());
             try (ResultSet r = s.executeQuery()) { return r.next(); }
         }
@@ -341,6 +497,7 @@ public final class SocietyService {
     }
 
     private Resident readResident(ResultSet r) throws SQLException {
+        String household = r.getString("household_uuid");
         String home = r.getString("home_property_uuid");
         String pos = r.getString("position_uuid");
         String p1 = r.getString("parent1_uuid");
@@ -350,6 +507,7 @@ public final class SocietyService {
                 UUID.fromString(r.getString("villager_uuid")),
                 r.getString("resident_name"),
                 UUID.fromString(r.getString("territory_claim_uuid")),
+                household == null ? null : UUID.fromString(household),
                 home == null ? null : UUID.fromString(home),
                 pos == null ? null : UUID.fromString(pos),
                 r.getString("occupation_label"),
@@ -362,7 +520,9 @@ public final class SocietyService {
 
     private record Housing(PropertyAddress property, PropertyMailbox mailbox) {}
 
-    public record Resident(UUID id, String name, UUID territoryClaimId, UUID homePropertyId, UUID positionId,
-                           String occupationLabel, UUID parent1Id, UUID parent2Id, Long bornAt, long createdAt) {}
+    private record Household(UUID id, UUID territoryId, UUID homePropertyId, UUID ownerAccountId, long createdAt) {}
+    public record Resident(UUID id, String name, UUID territoryClaimId, UUID householdId, UUID homePropertyId,
+                           UUID positionId, String occupationLabel, UUID parent1Id, UUID parent2Id,
+                           Long bornAt, long createdAt) {}
     public record ImmigrationResult(boolean moved, String message) {}
 }

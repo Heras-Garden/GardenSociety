@@ -1,3 +1,9 @@
 immigration:
   enabled: true
   interval-minutes: 10
+
+housing:
+  max-purchase-price: 500
+
+economy:
+  starting-obols: 500

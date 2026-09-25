@@ -1,3 +1,9 @@
 immigration:
   enabled: true
   interval-minutes: 10
+
+housing:
+  # Society residents only consider listed homes/apartment units at or below this price.
+  max-purchase-price: 500
+  # New residents receive enough starting balance to participate in the housing economy.
+  starting-obols: 500

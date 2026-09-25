@@ -4,6 +4,7 @@ import com.herasgarden.gardencore.api.GardenPlatform;
 import com.herasgarden.gardencore.api.claim.ClaimDirectoryService;
 import com.herasgarden.gardencore.api.land.GardenTerritoryDirectory;
 import com.herasgarden.gardencore.api.land.PropertyDirectory;
+import com.herasgarden.gardencore.api.land.PropertyManagementService;
 import com.herasgarden.gardencore.api.membership.TerritoryMembershipProvider;
 import com.herasgarden.gardentrade.api.BusinessDirectory;
 import org.bukkit.command.PluginCommand;
@@ -22,8 +23,9 @@ public final class GardenSociety extends JavaPlugin {
         ClaimDirectoryService claims = service(ClaimDirectoryService.class);
         TerritoryMembershipProvider memberships = service(TerritoryMembershipProvider.class);
         PropertyDirectory properties = service(PropertyDirectory.class);
+        PropertyManagementService propertyManagement = service(PropertyManagementService.class);
         BusinessDirectory businesses = service(BusinessDirectory.class);
-        if (platform == null || territories == null || claims == null || memberships == null || properties == null || businesses == null) {
+        if (platform == null || territories == null || claims == null || memberships == null || properties == null || propertyManagement == null || businesses == null) {
             getLogger().severe("GardenSociety requires active GardenCore, GardenLands, GardenCivics, and GardenTrade services.");
             getServer().getPluginManager().disablePlugin(this);
             return;
@@ -37,7 +39,7 @@ public final class GardenSociety extends JavaPlugin {
             return;
         }
 
-        SocietyService society = new SocietyService(this, platform, territories, claims, memberships, properties, businesses);
+        SocietyService society = new SocietyService(this, platform, territories, claims, memberships, properties, propertyManagement, businesses);
         SocietyCommand command = new SocietyCommand(society, territories);
         PluginCommand root = getCommand("society");
         if (root != null) {

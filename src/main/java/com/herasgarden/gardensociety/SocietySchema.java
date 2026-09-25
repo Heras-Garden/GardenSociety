@@ -28,7 +28,10 @@ public final class SocietySchema {
                     + "parent2_uuid VARCHAR(36) NULL,"
                     + "born_at BIGINT NULL,"
                     + "created_at BIGINT NOT NULL)");
-            s.executeUpdate("CREATE UNIQUE INDEX IF NOT EXISTS idx_gs_resident_home "
+            // Older builds enforced one resident per home. Households share a
+            // residence, so migrate that index to a normal lookup index.
+            s.executeUpdate("DROP INDEX IF EXISTS idx_gs_resident_home");
+            s.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gs_resident_home "
                     + "ON gs_residents (home_property_uuid)");
             s.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gs_resident_territory "
                     + "ON gs_residents (territory_claim_uuid)");

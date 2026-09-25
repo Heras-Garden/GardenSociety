@@ -25,7 +25,10 @@ public final class SocietySchema {
                     + "territory_claim_uuid VARCHAR(36) NOT NULL,"
                     + "home_property_uuid VARCHAR(36) NOT NULL UNIQUE,"
                     + "owner_account_uuid VARCHAR(36) NOT NULL,"
+                    + "state VARCHAR(24) NOT NULL DEFAULT 'ACTIVE',"
                     + "created_at BIGINT NOT NULL)");
+            ensureColumn(c, "gs_households", "state",
+                    "ALTER TABLE gs_households ADD COLUMN state VARCHAR(24) NOT NULL DEFAULT 'ACTIVE'");
 
             s.executeUpdate("CREATE TABLE IF NOT EXISTS gs_residents ("
                     + "villager_uuid VARCHAR(36) PRIMARY KEY,"
@@ -110,8 +113,8 @@ public final class SocietySchema {
                 try {
                     try (java.sql.PreparedStatement i = c.prepareStatement(
                             "INSERT INTO gs_households "
-                                    + "(household_uuid, territory_claim_uuid, home_property_uuid, owner_account_uuid, created_at) "
-                                    + "VALUES (?, ?, ?, ?, ?)")) {
+                                    + "(household_uuid, territory_claim_uuid, home_property_uuid, owner_account_uuid, state, created_at) "
+                                    + "VALUES (?, ?, ?, ?, 'ACTIVE', ?)")) {
                         i.setString(1, householdId.toString());
                         i.setString(2, territory);
                         i.setString(3, entry.getValue().toString());

@@ -274,8 +274,9 @@ public final class SocietyService {
         UUID positionId = vacancy == null ? null : vacancy.positionId();
         String occupation = vacancy == null ? null : vacancy.positionTitle() + " @ " + vacancy.businessName();
 
+        boolean newHousehold = parent1 == null && parent2 == null;
         Household household;
-        if (parent1 != null || parent2 != null) {
+        if (!newHousehold) {
             household = householdForParent(parent1, parent2)
                     .orElseThrow(() -> new IllegalArgumentException(
                             "A Society child needs an existing parental household."));
@@ -321,6 +322,9 @@ public final class SocietyService {
                 try { businesses.vacate(positionId, villager.getUniqueId()); } catch (SQLException ignored) {}
             }
             try { memberships.clearMembership(villager.getUniqueId()); } catch (SQLException ignored) {}
+            if (newHousehold) {
+                try { markHouseholdReview(household.id()); } catch (SQLException ignored) {}
+            }
             if (exception instanceof SQLException sql) throw sql;
             if (exception instanceof RuntimeException runtime) throw runtime;
             throw new SQLException("Society resident creation failed.", exception);
@@ -345,22 +349,6 @@ public final class SocietyService {
             String residentName
     ) throws SQLException {
         UUID householdId = UUID.randomUUID();
-        long current = platform.currency().balance(householdId);
-        long target = Math.max(startingObols, home.property().price());
-        if (current < target && !platform.currency().deposit(householdId, target - current)) {
-            throw new IllegalArgumentException("Society household starting funds could not be created.");
-        }
-
-        PropertyPurchaseResult purchase = propertyManagement.purchaseAccount(
-                householdId,
-                residentName + " Household",
-                "SOCIETY_CITIZEN",
-                home.property().propertyId()
-        );
-        if (!purchase.success()) {
-            throw new IllegalArgumentException("Society home purchase failed: " + purchase.message());
-        }
-
         Household household = new Household(
                 householdId,
                 territory.claimId(),
@@ -368,11 +356,14 @@ public final class SocietyService {
                 householdId,
                 System.currentTimeMillis()
         );
+
+        // Reserve the home before money or ownership changes. A later failure
+        // remains visible as REVIEW rather than making the home look vacant.
         try (Connection c = platform.storage().connection();
              PreparedStatement s = c.prepareStatement(
                      "INSERT INTO gs_households "
-                             + "(household_uuid, territory_claim_uuid, home_property_uuid, owner_account_uuid, created_at) "
-                             + "VALUES (?, ?, ?, ?, ?)")) {
+                             + "(household_uuid, territory_claim_uuid, home_property_uuid, "
+                             + "owner_account_uuid, state, created_at) VALUES (?, ?, ?, ?, 'PENDING', ?)")) {
             s.setString(1, household.id().toString());
             s.setString(2, household.territoryId().toString());
             s.setString(3, household.homePropertyId().toString());
@@ -380,11 +371,66 @@ public final class SocietyService {
             s.setLong(5, household.createdAt());
             s.executeUpdate();
         }
-        return household;
+
+        try {
+            long current = platform.currency().balance(householdId);
+            long target = Math.max(startingObols, home.property().price());
+            if (current < target && !platform.currency().deposit(householdId, target - current)) {
+                throw new IllegalArgumentException("Society household starting funds could not be created.");
+            }
+
+            PropertyPurchaseResult purchase = propertyManagement.purchaseAccount(
+                    householdId,
+                    residentName + " Household",
+                    "SOCIETY_CITIZEN",
+                    home.property().propertyId()
+            );
+            if (!purchase.success()) {
+                throw new IllegalArgumentException("Society home purchase failed: " + purchase.message());
+            }
+
+            try (Connection c = platform.storage().connection();
+                 PreparedStatement s = c.prepareStatement(
+                         "UPDATE gs_households SET state = 'ACTIVE' "
+                                 + "WHERE household_uuid = ? AND state = 'PENDING'")) {
+                s.setString(1, householdId.toString());
+                if (s.executeUpdate() != 1) {
+                    markHouseholdReview(householdId);
+                    throw new SQLException(
+                            "The home was purchased but household activation needs administrator review.");
+                }
+            }
+            return household;
+        } catch (IllegalArgumentException exception) {
+            deletePendingHousehold(householdId);
+            throw exception;
+        } catch (SQLException exception) {
+            try { markHouseholdReview(householdId); } catch (SQLException ignored) {}
+            throw exception;
+        }
+    }
+
+    private void deletePendingHousehold(UUID householdId) throws SQLException {
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "DELETE FROM gs_households WHERE household_uuid = ? AND state = 'PENDING'")) {
+            s.setString(1, householdId.toString());
+            s.executeUpdate();
+        }
+    }
+
+    private void markHouseholdReview(UUID householdId) throws SQLException {
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "UPDATE gs_households SET state = 'REVIEW' WHERE household_uuid = ?")) {
+            s.setString(1, householdId.toString());
+            s.executeUpdate();
+        }
     }
 
     private Optional<Household> householdForParent(UUID parent1, UUID parent2) throws SQLException {
-        for (UUID parent : List.of(parent1, parent2)) {
+        UUID[] parents = {parent1, parent2};
+        for (UUID parent : parents) {
             if (parent == null) continue;
             Resident resident = resident(parent).orElse(null);
             if (resident == null || resident.householdId() == null) continue;

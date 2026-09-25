@@ -1,6 +1,7 @@
 package com.herasgarden.gardensociety;
 
 import com.herasgarden.gardencore.api.GardenPlatform;
+import com.herasgarden.gardencore.api.claim.ClaimDirectoryService;
 import com.herasgarden.gardencore.api.land.GardenTerritoryDirectory;
 import com.herasgarden.gardencore.api.land.PropertyDirectory;
 import com.herasgarden.gardencore.api.membership.TerritoryMembershipProvider;
@@ -18,10 +19,11 @@ public final class GardenSociety extends JavaPlugin {
 
         GardenPlatform platform = service(GardenPlatform.class);
         GardenTerritoryDirectory territories = service(GardenTerritoryDirectory.class);
+        ClaimDirectoryService claims = service(ClaimDirectoryService.class);
         TerritoryMembershipProvider memberships = service(TerritoryMembershipProvider.class);
         PropertyDirectory properties = service(PropertyDirectory.class);
         BusinessDirectory businesses = service(BusinessDirectory.class);
-        if (platform == null || territories == null || memberships == null || properties == null || businesses == null) {
+        if (platform == null || territories == null || claims == null || memberships == null || properties == null || businesses == null) {
             getLogger().severe("GardenSociety requires active GardenCore, GardenLands, GardenCivics, and GardenTrade services.");
             getServer().getPluginManager().disablePlugin(this);
             return;
@@ -35,7 +37,7 @@ public final class GardenSociety extends JavaPlugin {
             return;
         }
 
-        SocietyService society = new SocietyService(this, platform, territories, memberships, properties, businesses);
+        SocietyService society = new SocietyService(this, platform, territories, claims, memberships, properties, businesses);
         SocietyCommand command = new SocietyCommand(society, territories);
         PluginCommand root = getCommand("society");
         if (root != null) {

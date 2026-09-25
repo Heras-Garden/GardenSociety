@@ -7,6 +7,8 @@ import com.herasgarden.gardencore.api.land.GardenTerritoryDirectory;
 import com.herasgarden.gardencore.api.land.PropertyAddress;
 import com.herasgarden.gardencore.api.land.PropertyDirectory;
 import com.herasgarden.gardencore.api.land.PropertyMailbox;
+import com.herasgarden.gardencore.api.land.PropertyManagementService;
+import com.herasgarden.gardencore.api.land.PropertyPurchaseResult;
 import com.herasgarden.gardencore.api.land.TerritorySummary;
 import com.herasgarden.gardencore.api.membership.TerritoryMembershipProvider;
 import com.herasgarden.gardentrade.api.BusinessDirectory;
@@ -39,6 +41,8 @@ public final class SocietyService {
     private final ClaimDirectoryService claims;
     private final TerritoryMembershipProvider memberships;
     private final PropertyDirectory properties;
+    private final PropertyManagementService propertyManagement;
+    private final SocietyHousingRepository housingRepository;
     private final BusinessDirectory businesses;
 
     public SocietyService(
@@ -48,6 +52,7 @@ public final class SocietyService {
             ClaimDirectoryService claims,
             TerritoryMembershipProvider memberships,
             PropertyDirectory properties,
+            PropertyManagementService propertyManagement,
             BusinessDirectory businesses
     ) {
         this.plugin = plugin;
@@ -56,6 +61,8 @@ public final class SocietyService {
         this.claims = claims;
         this.memberships = memberships;
         this.properties = properties;
+        this.propertyManagement = propertyManagement;
+        this.housingRepository = new SocietyHousingRepository(platform.storage());
         this.businesses = businesses;
     }
 
@@ -162,7 +169,9 @@ public final class SocietyService {
             if (resident(child.getUniqueId()).isPresent()) return;
             TerritorySummary territory = territories.findByClaim(a.territoryClaimId()).orElse(null);
             if (territory == null) return;
-            makeResident(child, territory, null, null, a.id(), b.id(), false);
+            UUID inheritedHome = a.homePropertyId() != null ? a.homePropertyId() : b.homePropertyId();
+            Housing householdHome = inheritedHome == null ? null : housing(inheritedHome).orElse(null);
+            makeResident(child, territory, householdHome, null, a.id(), b.id(), false);
         } catch (Exception exception) {
             plugin.getLogger().warning("Could not register Society birth: " + exception.getMessage());
         }
@@ -197,7 +206,16 @@ public final class SocietyService {
     public int population(String territoryName) {
         TerritorySummary territory = territories.findByName(territoryName)
                 .orElseThrow(() -> new IllegalArgumentException("That Territory does not exist."));
-        return memberships.members(territory.claimId()).size();
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement(
+                     "SELECT COUNT(*) FROM gs_residents WHERE territory_claim_uuid = ?")) {
+            s.setString(1, territory.claimId().toString());
+            try (ResultSet r = s.executeQuery()) {
+                return r.next() ? r.getInt(1) : 0;
+            }
+        } catch (SQLException exception) {
+            throw new IllegalStateException("Society population could not be read.", exception);
+        }
     }
 
     public String card(Resident resident) throws SQLException {
@@ -267,8 +285,29 @@ public final class SocietyService {
             throw new SQLException("Society resident creation failed.", exception);
         }
 
-        applyIdentity(villager, name);
         Resident resident = resident(villager.getUniqueId()).orElseThrow();
+
+        // Children share their household's existing home. New adoptees/immigrants
+        // actually buy the listed property through the shared atomic sale path.
+        if (home != null && parent1 == null && parent2 == null) {
+            long startingObols = Math.max(0L, plugin.getConfig().getLong("housing.starting-obols", 500L));
+            long beforeBalance = platform.currency().balance(resident.id());
+            long credited = Math.max(0L, startingObols - beforeBalance);
+            if (credited > 0 && !platform.currency().deposit(resident.id(), credited)) {
+                rollbackResidentCreation(resident, positionId, hired);
+                throw new IllegalArgumentException("The resident account could not receive its starting Obols.");
+            }
+
+            PropertyPurchaseResult purchase = propertyManagement.purchaseAccount(
+                    resident.id(), resident.name(), "SOCIETY_CITIZEN", home.property().propertyId());
+            if (!purchase.success()) {
+                if (credited > 0) platform.currency().withdraw(resident.id(), credited);
+                rollbackResidentCreation(resident, positionId, hired);
+                throw new IllegalArgumentException("The selected home could not be purchased: " + purchase.message());
+            }
+        }
+
+        applyIdentity(villager, name);
         if (immigration && home != null && positionId != null) logImmigration(territory.claimId(), resident.id(), home.property().propertyId(), positionId);
         return resident;
     }
@@ -291,23 +330,42 @@ public final class SocietyService {
 
     private List<Housing> vacantHomes(UUID territoryId) throws SQLException {
         List<Housing> homes = new ArrayList<>();
-        try (Connection c = platform.storage().connection();
-             PreparedStatement s = c.prepareStatement("SELECT property_uuid FROM gs_housing WHERE npc_eligible = 1 ORDER BY updated_at ASC");
-             ResultSet r = s.executeQuery()) {
-            while (r.next()) {
-                UUID propertyId = UUID.fromString(r.getString("property_uuid"));
-                if (occupied(propertyId)) continue;
-                PropertyAddress property = properties.find(propertyId).orElse(null);
-                if (property == null) continue;
-                if (!claims.territoryAncestor(property.claimId()).filter(territoryId::equals).isPresent()) continue;
-                ClaimSummary info = claims.find(property.claimId()).orElse(null);
-                if (info == null || !isNpcHousingType(info)) continue;
-                PropertyMailbox mailbox = properties.mailbox(propertyId).orElse(null);
-                if (mailbox == null) continue;
-                homes.add(new Housing(property, mailbox));
-            }
+        long maxPrice = Math.max(1L, plugin.getConfig().getLong("housing.max-purchase-price", 500L));
+
+        // Load IDs first and release the connection before any other storage-backed
+        // service calls. SQLite uses a one-connection pool by default.
+        for (UUID propertyId : housingRepository.eligiblePropertyIds()) {
+            if (occupied(propertyId)) continue;
+            PropertyAddress property = properties.find(propertyId).orElse(null);
+            if (property == null || !property.forSale() || property.price() <= 0 || property.price() > maxPrice) continue;
+            if (!claims.territoryAncestor(property.claimId()).filter(territoryId::equals).isPresent()) continue;
+            ClaimSummary info = claims.find(property.claimId()).orElse(null);
+            if (info == null || !isNpcHousingType(info)) continue;
+            PropertyMailbox mailbox = properties.mailbox(propertyId).orElse(null);
+            if (mailbox == null) continue;
+            homes.add(new Housing(property, mailbox));
         }
         return List.copyOf(homes);
+    }
+
+    private Optional<Housing> housing(UUID propertyId) throws SQLException {
+        PropertyAddress property = properties.find(propertyId).orElse(null);
+        if (property == null) return Optional.empty();
+        PropertyMailbox mailbox = properties.mailbox(propertyId).orElse(null);
+        return mailbox == null ? Optional.empty() : Optional.of(new Housing(property, mailbox));
+    }
+
+    private void rollbackResidentCreation(Resident resident, UUID positionId, boolean hired) {
+        if (hired && positionId != null) {
+            try { businesses.vacate(positionId, resident.id()); } catch (SQLException ignored) {}
+        }
+        try { memberships.clearMembership(resident.id()); } catch (SQLException ignored) {}
+        try (Connection c = platform.storage().connection();
+             PreparedStatement s = c.prepareStatement("DELETE FROM gs_residents WHERE villager_uuid = ?")) {
+            s.setString(1, resident.id().toString());
+            s.executeUpdate();
+        } catch (SQLException ignored) {
+        }
     }
 
     private List<BusinessDirectory.Vacancy> vacancies(UUID territoryId) throws SQLException {

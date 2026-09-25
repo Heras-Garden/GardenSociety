@@ -1,0 +1,19 @@
+name: GardenSociety
+version: '${project.version}'
+main: com.herasgarden.gardensociety.GardenSociety
+api-version: '26.2'
+author: Hera's Garden
+website: https://herasgarden.net
+description: Society residents, immigration, housing, jobs, and families for The Garden SMP.
+depend: [GardenCore, GardenLands, GardenCivics, GardenTrade]
+
+commands:
+  society:
+    description: Manage and inspect Garden Society residents.
+    usage: /society <housing|adopt|info|population|immigrate>
+
+permissions:
+  gardensociety.use:
+    default: true
+  gardensociety.admin:
+    default: op
